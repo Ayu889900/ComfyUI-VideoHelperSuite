@@ -1807,6 +1807,7 @@ app.registerExtension({
         defaultValue: false,
         onChange(value) {
             if (!value) {
+                clearAllLatentPreviews()
                 //Remove any previewWidgets
                 for (let id of latentPreviewNodes) {
                     let n = app.graph.getNodeById(id)
@@ -2389,14 +2390,35 @@ app.registerExtension({
     },
 });
 let previewImages = []
+let latentPreviewJobId = null
+let latentPreviewExecutingId = null
+api.addEventListener('execution_start', ({ detail }) => {
+    latentPreviewJobId = detail.prompt_id
+    latentPreviewExecutingId = null
+});
+for (const event of ['execution_success', 'execution_error', 'execution_interrupted']) {
+    api.addEventListener(event, ({ detail }) => {
+        if (detail.prompt_id === latentPreviewJobId) {
+            latentPreviewJobId = null
+            latentPreviewExecutingId = null
+        }
+    });
+}
 api.addEventListener('executing', ({ detail }) => {
+    const executingId = typeof detail === 'object' ? detail?.node : detail
+    latentPreviewExecutingId = executingId == null ? null : String(executingId)
     if (detail === null) {
+        latentPreviewJobId = null
         for (let graph of [app.graph, ...app.graph.subgraphs.values()]) {
             for (let node of graph._nodes) {
                 if (node.type.startsWith("VHS_")) {
                     node.onPromptExecuted?.()
                 }
             }
+        }
+    } else {
+        if (latentPreviewExecutingId != null) {
+            clearLatentPreviewNode(latentPreviewExecutingId)
         }
     }
 })
@@ -2406,14 +2428,14 @@ function getLatentPreviewCtx(id, width, height) {
         return undefined
     }
 
+    // App preview events can recreate the native thumbnail after this widget exists.
+    let nativePreview = node.widgets.findIndex((w) => w.name == '$$canvas-image-preview')
+    if (nativePreview >= 0) {
+        node.imgs = []
+        node.widgets.splice(nativePreview,1)[0].onRemove?.()
+    }
     let previewWidget = node.widgets.find((w) => w.name == "vhslatentpreview")
     if (!previewWidget) {
-        //check for and remove any native preview
-        let nativePreview = node.widgets.findIndex((w) => w.name == '$$canvas-image-preview')
-        if (nativePreview >= 0) {
-            node.imgs = []
-            node.widgets.splice(nativePreview,1)
-        }
         let canvasEl = document.createElement("canvas")
         canvasEl.style.width = "100%"
         previewWidget = node.addDOMWidget("vhslatentpreview", "vhscanvas", canvasEl, {
@@ -2465,50 +2487,114 @@ function getLatentPreviewCtx(id, width, height) {
     }
     return canvasEl.getContext("2d")
 }
-let animateIntervals = {}
-function beginLatentPreview(id, previewImages, rate) {
-    latentPreviewNodes.add(id)
-    if (animateIntervals[id]) {
-        clearTimeout(animateIntervals[id])
-    }
-    let displayIndex = 0
-    let node = getNodeById(id)
-    //While progress is safely cleared on execution completion.
-    //Initial progress must be started here to avoid a race condition
-    node.progress = 0
-    animateIntervals[id] = setInterval(() => {
-        if (getNodeById(id)?.progress == undefined
-            || app.canvas.graph.rootGraph != node.graph.rootGraph) {
-            clearTimeout(animateIntervals[id])
-            delete animateIntervals[id]
-            return
-        }
-        if (!previewImages[displayIndex]) {
-            return
-        }
-        getLatentPreviewCtx(id, previewImages[displayIndex].width,
-            previewImages[displayIndex].height)?.drawImage?.(previewImages[displayIndex],0,0)
-        displayIndex = (displayIndex + 1) % previewImages.length
-    }, 1000/rate);
-
-}
 let previewImagesDict = {}
+let latentPreviewPlayers = {}
+let animateSources = {}
+let latentPreviewSyncEpochs = {}
+let latentPreviewAnimationFrame
+function stopLatentPreviewPlayer(id) {
+    const groupKey = latentPreviewPlayers[id]?.groupKey
+    delete latentPreviewPlayers[id]
+    if (groupKey && !Object.values(latentPreviewPlayers).some((p) => p.groupKey === groupKey)) delete latentPreviewSyncEpochs[groupKey]
+    if (Object.keys(latentPreviewPlayers).length == 0 && latentPreviewAnimationFrame != null) {
+        cancelAnimationFrame(latentPreviewAnimationFrame)
+        latentPreviewAnimationFrame = undefined
+    }
+    delete animateSources[id]
+}
+function clearLatentPreviewSource(sourceId) {
+    const frames = previewImagesDict[sourceId]
+    if (frames) {
+        for (const frame of frames) frame?.image.close()
+        delete previewImagesDict[sourceId]
+    }
+    for (const [id, source] of Object.entries(animateSources)) {
+        if (source === sourceId) {
+            stopLatentPreviewPlayer(id)
+            const canvas = getNodeById(id)?.widgets?.find((w) => w.name == 'vhslatentpreview')?.element
+            canvas?.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height)
+        }
+    }
+}
+function clearLatentPreviewNode(nodeId) {
+    for (const sourceId of Object.keys(previewImagesDict)) {
+        if (sourceId === nodeId || sourceId.endsWith(`:${nodeId}`)) clearLatentPreviewSource(sourceId)
+    }
+}
+function clearAllLatentPreviews() {
+    for (const sourceId of Object.keys(previewImagesDict)) clearLatentPreviewSource(sourceId)
+    for (const id of Object.keys(latentPreviewPlayers)) stopLatentPreviewPlayer(id)
+}
+function updateAppLatentPreview(player, frame) {
+    const workflow = app.extensionManager.workflow.activeWorkflow
+    const mode = workflow?.activeMode ?? workflow?.initialMode
+    if ((mode !== 'app' && mode !== 'builder:arrange')
+        || !player.jobId || player.jobId !== latentPreviewJobId
+        || player.sourceId !== latentPreviewExecutingId) {
+        player.lastAppImage = undefined
+        return
+    }
+    if (frame.image === player.lastAppImage) return
+    // Reuse the original JPEG and the frontend's preview URL lifecycle.
+    const parts = player.sourceId.split(':')
+    api.dispatchCustomEvent('b_preview_with_metadata', {
+        blob: frame.blob,
+        nodeId: player.sourceId,
+        displayNodeId: player.sourceId,
+        parentNodeId: parts.length > 1 ? parts.slice(0, -1).join(':') : null,
+        realNodeId: parts.at(-1),
+        jobId: player.jobId,
+    })
+    player.lastAppImage = frame.image
+}
+function animateLatentPreviews(timestamp) {
+    latentPreviewAnimationFrame = undefined
+    for (const [id, player] of Object.entries(latentPreviewPlayers)) {
+        if (!getNodeById(player.sourceId)) {
+            clearLatentPreviewSource(player.sourceId)
+            continue
+        }
+        if (app.canvas.graph.rootGraph != player.node.graph.rootGraph) continue
+        const index = Math.floor((timestamp - latentPreviewSyncEpochs[player.groupKey]) * player.rate / 1000) % player.previewImages.length
+        const frame = player.previewImages[index]
+        if (!frame) continue
+        if (id === player.sourceId) updateAppLatentPreview(player, frame)
+        const image = frame.image
+        if (image === player.lastImage && !player.node.widgets.some((w) => w.name == '$$canvas-image-preview')) continue
+        getLatentPreviewCtx(id, image.width, image.height)?.drawImage?.(image, 0, 0)
+        player.lastImage = image
+    }
+    if (Object.keys(latentPreviewPlayers).length != 0) latentPreviewAnimationFrame = requestAnimationFrame(animateLatentPreviews)
+}
+function beginLatentPreview(id, previewImages, rate, sourceId) {
+    latentPreviewNodes.add(id)
+    stopLatentPreviewPlayer(id)
+    const node = getNodeById(id)
+    node.progress = 0
+    const groupKey = `${previewImages.length}:${rate}`
+    latentPreviewSyncEpochs[groupKey] ??= performance.now()
+    animateSources[id] = sourceId
+    latentPreviewPlayers[id] = { previewImages, rate, sourceId, groupKey, node,
+        jobId: latentPreviewJobId, lastImage: undefined, lastAppImage: undefined }
+    if (latentPreviewAnimationFrame == null) latentPreviewAnimationFrame = requestAnimationFrame(animateLatentPreviews)
+}
 api.addEventListener('VHS_latentpreview', ({ detail }) => {
     if (detail.id == null) {
         return
     }
+    clearLatentPreviewSource(detail.id)
     let previewImages = previewImagesDict[detail.id] = []
     previewImages.length = detail.length
 
     let idParts = detail.id.split(':')
     for (let i=1; i <= idParts.length; i++) {
         let id = idParts.slice(0,i).join(':')
-        beginLatentPreview(id, previewImages, detail.rate)
+        beginLatentPreview(id, previewImages, detail.rate, detail.id)
     }
 });
 let td = new TextDecoder()
 api.addEventListener('b_preview', async (e) => {
-    if (Object.keys(animateIntervals).length == 0) {
+    if (Object.keys(latentPreviewPlayers).length == 0) {
         return
     }
     e.preventDefault()
@@ -2518,6 +2604,14 @@ api.addEventListener('b_preview', async (e) => {
     const index = dv.getUint32(4)
     const idlen = dv.getUint8(8)
     const id = td.decode(dv.buffer.slice(9,9+idlen))
-    previewImagesDict[id][index] = await window.createImageBitmap(e.detail.slice(24))
+    const frames = previewImagesDict[id]
+    const blob = e.detail.slice(24, e.detail.size, 'image/jpeg')
+    const image = await window.createImageBitmap(blob)
+    if (!frames || frames !== previewImagesDict[id]) {
+        image.close()
+        return false
+    }
+    frames[index]?.image.close()
+    frames[index] = { image, blob }
     return false
 }, true);
