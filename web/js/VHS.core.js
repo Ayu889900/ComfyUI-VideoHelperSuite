@@ -2391,24 +2391,31 @@ app.registerExtension({
 });
 let previewImages = []
 let latentPreviewJobId = null
-let latentPreviewExecutingId = null
+let appLatentPreviewSourceId = null
 api.addEventListener('execution_start', ({ detail }) => {
     latentPreviewJobId = detail.prompt_id
-    latentPreviewExecutingId = null
+    appLatentPreviewSourceId = null
 });
 for (const event of ['execution_success', 'execution_error', 'execution_interrupted']) {
     api.addEventListener(event, ({ detail }) => {
         if (detail.prompt_id === latentPreviewJobId) {
             latentPreviewJobId = null
-            latentPreviewExecutingId = null
+            appLatentPreviewSourceId = null
         }
     });
 }
+api.addEventListener('executed', ({ detail }) => {
+    if (detail.prompt_id !== latentPreviewJobId) return
+    const outputs = app.graph.extra?.linearData?.outputs ?? []
+    const nodeId = String(detail.display_node || detail.node)
+    if (!outputs.length || outputs.some((id) => String(id) === nodeId)) {
+        appLatentPreviewSourceId = null
+    }
+});
 api.addEventListener('executing', ({ detail }) => {
-    const executingId = typeof detail === 'object' ? detail?.node : detail
-    latentPreviewExecutingId = executingId == null ? null : String(executingId)
     if (detail === null) {
         latentPreviewJobId = null
+        appLatentPreviewSourceId = null
         for (let graph of [app.graph, ...app.graph.subgraphs.values()]) {
             for (let node of graph._nodes) {
                 if (node.type.startsWith("VHS_")) {
@@ -2417,8 +2424,9 @@ api.addEventListener('executing', ({ detail }) => {
             }
         }
     } else {
-        if (latentPreviewExecutingId != null) {
-            clearLatentPreviewNode(latentPreviewExecutingId)
+        const id = typeof detail === 'object' ? detail?.node : detail
+        if (id != null) {
+            clearLatentPreviewNode(String(id))
         }
     }
 })
@@ -2530,7 +2538,7 @@ function updateAppLatentPreview(player, frame) {
     const mode = workflow?.activeMode ?? workflow?.initialMode
     if ((mode !== 'app' && mode !== 'builder:arrange')
         || !player.jobId || player.jobId !== latentPreviewJobId
-        || player.sourceId !== latentPreviewExecutingId) {
+        || player.sourceId !== appLatentPreviewSourceId) {
         player.lastAppImage = undefined
         return
     }
@@ -2582,6 +2590,7 @@ api.addEventListener('VHS_latentpreview', ({ detail }) => {
     if (detail.id == null) {
         return
     }
+    appLatentPreviewSourceId = detail.id
     clearLatentPreviewSource(detail.id)
     let previewImages = previewImagesDict[detail.id] = []
     previewImages.length = detail.length
